@@ -13,9 +13,19 @@ echo "  Axios Supply Chain Attack — Detection"
 echo "============================================"
 echo ""
 
+# --- Resolve scan root ---
+SCAN_ROOT="${1:-.}"
+if [ ! -d "$SCAN_ROOT" ]; then
+  echo "ERROR: '$SCAN_ROOT' is not a directory"
+  exit 1
+fi
+SCAN_ROOT="$(cd "$SCAN_ROOT" && pwd -P)"  # -P resolves symlinks (e.g. /tmp -> /private/tmp on macOS)
+echo "  Scan root: $SCAN_ROOT"
+echo ""
+
 FOUND=0
 
-# --- Check 1: Installed axios version ---
+# --- Check 1: Installed axios version (global, runs once) ---
 echo "[1/6] Checking installed axios version..."
 if command -v npm &> /dev/null; then
   AXIOS_VER=$(npm list axios 2>/dev/null | grep -oE "1\.14\.1|0\.30\.4")
@@ -29,59 +39,100 @@ else
   echo "  SKIP: npm not found"
 fi
 
-# --- Check 2: Lockfile contains compromised version ---
+# --- Checks 2, 3, 4: Run recursively for each directory containing a lockfile ---
 echo ""
-echo "[2/6] Checking lockfile for compromised versions..."
-if [ -f "package-lock.json" ]; then
-  LOCK_HIT=$(grep -E "1\.14\.1|0\.30\.4" package-lock.json | head -3)
-  if [ -n "$LOCK_HIT" ]; then
-    echo "  !! AFFECTED: Compromised version found in package-lock.json"
-    echo "  $LOCK_HIT"
-    FOUND=1
-  else
-    echo "  OK: Lockfile clean"
-  fi
-elif [ -f "yarn.lock" ]; then
-  LOCK_HIT=$(grep -E "1\.14\.1|0\.30\.4" yarn.lock | head -3)
-  if [ -n "$LOCK_HIT" ]; then
-    echo "  !! AFFECTED: Compromised version found in yarn.lock"
-    FOUND=1
-  else
-    echo "  OK: Lockfile clean"
-  fi
-else
-  echo "  SKIP: No lockfile found in current directory"
+echo "[2-4/6] Scanning for lockfiles recursively (excluding node_modules)..."
+echo "  find root : $SCAN_ROOT"
+
+# Collect all matching lockfiles first so we can log them
+RAW_LOCKFILES=()
+while IFS= read -r f; do
+  RAW_LOCKFILES+=("$f")
+done < <(find "$SCAN_ROOT" \( -name "package-lock.json" -o -name "yarn.lock" \) -not -path "*/node_modules/*" | sort)
+
+echo "  lockfiles found: ${#RAW_LOCKFILES[@]}"
+for f in "${RAW_LOCKFILES[@]}"; do
+  echo "    $f"
+done
+
+# Deduplicate to unique directories
+UNIQUE_DIRS=()
+if [ ${#RAW_LOCKFILES[@]} -gt 0 ]; then
+  while IFS= read -r dir; do
+    UNIQUE_DIRS+=("$dir")
+  done < <(printf '%s\n' "${RAW_LOCKFILES[@]}" | sed 's|/[^/]*$||' | sort -u)
 fi
 
-# --- Check 3: Lockfile git history ---
-echo ""
-echo "[3/6] Checking lockfile git history (forensic source of truth)..."
-if [ -d ".git" ]; then
-  GIT_HIT=$(git log -p -- package-lock.json yarn.lock 2>/dev/null | grep -E "plain-crypto-js" | head -3)
-  if [ -n "$GIT_HIT" ]; then
-    echo "  !! WARNING: plain-crypto-js appeared in lockfile history"
-    echo "  $GIT_HIT"
-    echo "  (Your system MAY have been compromised even if node_modules is clean now)"
-    FOUND=1
-  else
-    echo "  OK: No trace in git history"
-  fi
+if [ ${#UNIQUE_DIRS[@]} -eq 0 ]; then
+  echo "  SKIP: No lockfiles found under $SCAN_ROOT"
 else
-  echo "  SKIP: Not a git repository"
+  TOTAL=${#UNIQUE_DIRS[@]}
+  echo "  Unique directories to scan: $TOTAL"
+
+  IDX=0
+  for dir in "${UNIQUE_DIRS[@]}"; do
+    IDX=$((IDX + 1))
+    echo ""
+    echo "  ── [$IDX/$TOTAL] $dir"
+
+    # --- Check 2: Lockfile contains compromised axios version ---
+    if [ -f "$dir/package-lock.json" ]; then
+      # Match the axios entry (v2/v3: "node_modules/axios", v1: "axios": {) then
+      # check if the version within those lines is the compromised one.
+      # Two separate greps avoid the non-portable \| alternation in BRE on macOS.
+      LOCK_HIT=$({ grep -A 3 '"node_modules/axios":' "$dir/package-lock.json"; \
+                   grep -A 3 '"axios": {' "$dir/package-lock.json"; } \
+                 | grep -E '"version": "(1\.14\.1|0\.30\.4)"')
+      if [ -n "$LOCK_HIT" ]; then
+        echo "    [2] !! AFFECTED: axios at compromised version found in package-lock.json"
+        echo "        $LOCK_HIT"
+        FOUND=1
+      else
+        echo "    [2] OK: package-lock.json clean"
+      fi
+    fi
+
+    if [ -f "$dir/yarn.lock" ]; then
+      # Match the axios block header, then check the version line beneath it.
+      LOCK_HIT=$(grep -A 2 '^axios@' "$dir/yarn.lock" \
+                 | grep -E 'version "(1\.14\.1|0\.30\.4)"')
+      if [ -n "$LOCK_HIT" ]; then
+        echo "    [2] !! AFFECTED: axios at compromised version found in yarn.lock"
+        echo "        $LOCK_HIT"
+        FOUND=1
+      else
+        echo "    [2] OK: yarn.lock clean"
+      fi
+    fi
+
+    # --- Check 3: Lockfile git history ---
+    GIT_ROOT=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)
+    if [ -n "$GIT_ROOT" ]; then
+      GIT_HIT=$(git -C "$dir" log -p -- package-lock.json yarn.lock 2>/dev/null | grep -E "plain-crypto-js" | head -3)
+      if [ -n "$GIT_HIT" ]; then
+        echo "    [3] !! WARNING: plain-crypto-js appeared in lockfile history"
+        echo "        $GIT_HIT"
+        echo "        (System MAY have been compromised even if node_modules is clean now)"
+        FOUND=1
+      else
+        echo "    [3] OK: No trace of plain-crypto-js in git history"
+      fi
+    else
+      echo "    [3] SKIP: Not inside a git repository"
+    fi
+
+    # --- Check 4: Malicious dependency in node_modules ---
+    if [ -d "$dir/node_modules/plain-crypto-js" ]; then
+      echo "    [4] !! AFFECTED: node_modules/plain-crypto-js/ EXISTS"
+      FOUND=1
+    else
+      echo "    [4] OK: plain-crypto-js not in node_modules"
+      echo "        (Note: The malware self-destructs — absence does NOT guarantee safety)"
+    fi
+  done
 fi
 
-# --- Check 4: Malicious dependency in node_modules ---
-echo ""
-echo "[4/6] Checking for malicious package in node_modules..."
-if [ -d "node_modules/plain-crypto-js" ]; then
-  echo "  !! AFFECTED: node_modules/plain-crypto-js/ EXISTS"
-  FOUND=1
-else
-  echo "  OK: plain-crypto-js not in node_modules"
-  echo "  (Note: The malware self-destructs — absence does NOT guarantee safety)"
-fi
-
-# --- Check 5: RAT artifacts on disk ---
+# --- Check 5: RAT artifacts on disk (global, runs once) ---
 echo ""
 echo "[5/6] Checking for RAT artifacts..."
 
@@ -105,7 +156,7 @@ else
   echo "  OK: Linux RAT artifact not found"
 fi
 
-# --- Check 6: Network connections to C2 ---
+# --- Check 6: Network connections to C2 (global, runs once) ---
 echo ""
 echo "[6/6] Checking for C2 connections..."
 C2_CHECK=$(netstat -an 2>/dev/null | grep "142.11.206.73" || ss -tn 2>/dev/null | grep "142.11.206.73")
